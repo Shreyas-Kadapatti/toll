@@ -1,15 +1,50 @@
 import hashlib
 import json
 from time import time
-from flask import Flask, request, jsonify, render_template, make_response
+from flask import Flask, request, jsonify, g, render_template, make_response
 from flask_cors import CORS
 from cryptography.fernet import Fernet
 import base64
-import pdfkit
+import sqlite3
+import pdfkit   # pip install pdfkit
+import os
 
+# --- Flask App Setup ---
 app = Flask(__name__)
 CORS(app)
 
+# --- SQLite Setup ---
+DATABASE = 'transactions.db'
+
+def get_db():
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = sqlite3.connect(DATABASE)
+        db.row_factory = sqlite3.Row
+    return db
+
+@app.teardown_appcontext
+def close_connection(exception):
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
+
+# Create the transactions table if it doesn't exist
+with app.app_context():
+    conn = get_db()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            car_number TEXT,
+            owner TEXT,
+            vehicle_type TEXT,
+            toll_amount REAL,
+            timestamp REAL
+        )
+    ''')
+    conn.commit()
+
+# --- Blockchain Class ---
 class Blockchain:
     def __init__(self):
         self.chain = []
@@ -75,7 +110,8 @@ class Blockchain:
 
 blockchain = Blockchain()
 
-# Routes
+# --- Flask Routes ---
+
 @app.route('/transactions/new', methods=['POST'])
 def new_transaction():
     values = request.get_json()
@@ -83,13 +119,28 @@ def new_transaction():
     if not all(k in values for k in required):
         return 'Missing values', 400
 
+    # Save to SQLite
+    try:
+        conn = get_db()
+        conn.execute('''
+            INSERT INTO transactions 
+            (car_number, owner, vehicle_type, toll_amount, timestamp)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (values['car_number'], values['owner'],
+              values['vehicle_type'], values['toll_amount'], time()))
+        conn.commit()
+    except sqlite3.Error as e:
+        return jsonify({"error": str(e)}), 500
+
+    # Add to blockchain (encrypted)
     index = blockchain.new_transaction(
         values['car_number'],
         values['owner'],
         values['vehicle_type'],
         values['toll_amount']
     )
-    return jsonify({'message': f'Transaction will be added to Block {index}'}), 201
+    response = {'message': f'Transaction will be added to Block {index}'}
+    return jsonify(response), 201
 
 @app.route('/mine', methods=['GET'])
 def mine():
@@ -98,13 +149,14 @@ def mine():
     proof = blockchain.proof_of_work(last_proof)
     previous_hash = blockchain.hash(last_block)
     block = blockchain.new_block(proof, previous_hash)
-    return jsonify({
+    response = {
         'message': 'New Block Forged',
         'index': block['index'],
         'transactions': block['transactions'],
         'proof': block['proof'],
         'previous_hash': block['previous_hash'],
-    }), 200
+    }
+    return jsonify(response), 200
 
 @app.route('/chain', methods=['GET'])
 def full_chain():
@@ -113,7 +165,11 @@ def full_chain():
         block_copy = block.copy()
         block_copy['present_hash'] = blockchain.hash(block)
         chain_with_hashes.append(block_copy)
-    return jsonify({'chain': chain_with_hashes, 'length': len(chain_with_hashes)}), 200
+    response = {
+        'chain': chain_with_hashes,
+        'length': len(chain_with_hashes),
+    }
+    return jsonify(response), 200
 
 @app.route('/decrypt', methods=['POST'])
 def decrypt_data():
@@ -126,21 +182,23 @@ def decrypt_data():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
+# --- PDF Generation ---
+
+@app.template_filter('datetime')
+def format_datetime(timestamp):
+    from datetime import datetime
+    return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+
 @app.route('/generate_pdf')
 def generate_pdf():
     try:
-        # Collect all transactions from all blocks
-        all_transactions = []
-        for block in blockchain.chain:
-            for tx in block['transactions']:
-                decrypted = blockchain._decrypt_data(tx)
-                all_transactions.append(decrypted)
-        
-        # Sort by timestamp
-        all_transactions.sort(key=lambda x: x['timestamp'], reverse=True)
-        
-        # Generate PDF
-        rendered = render_template('pdf_template.html', transactions=all_transactions)
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM transactions ORDER BY timestamp DESC")
+        transactions = [dict(row) for row in cur.fetchall()]
+        # Render HTML template for PDF
+        rendered = render_template('pdf_template.html', transactions=transactions)
+        # Generate PDF from HTML
         pdf = pdfkit.from_string(rendered, False)
         response = make_response(pdf)
         response.headers['Content-Type'] = 'application/pdf'
@@ -149,10 +207,9 @@ def generate_pdf():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.template_filter('datetime')
-def format_datetime(timestamp):
-    from datetime import datetime
-    return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
-
 if __name__ == '__main__':
+    # Make sure the templates directory exists for PDF rendering
+    if not os.path.exists('templates'):
+        os.makedirs('templates')
+    print("Encryption key (keep this safe if you want to persist data!):", blockchain.encryption_key.decode())
     app.run(port=5000)
